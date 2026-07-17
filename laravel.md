@@ -649,6 +649,15 @@ $request->validate(...)
 
 inside controllers.
 
+## Organisation of Form Requests
+
+In larger projects, avoid a flat list of classes in `app/Http/Requests`. Organise requests logically:
+- **By Resource/Feature:** Group them into subdirectories under `app/Http/Requests`, e.g.:
+  - `app/Http/Requests/User/StoreUserRequest.php`
+  - `app/Http/Requests/User/UpdateUserRequest.php`
+- **In Domain-Driven Layouts:** Place requests directly inside their corresponding Domain folder, e.g.:
+  - `app/Domains/User/Requests/StoreUserRequest.php`
+
 ---
 
 # API Responses
