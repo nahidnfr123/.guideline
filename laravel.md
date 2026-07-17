@@ -229,6 +229,42 @@ Value Objects have a stricter bar than Services/Actions: they must not perform I
 
 A Value Object should be fully constructible and usable from its constructor arguments alone, with no side effects and no reads from external state. If a value needs configuration or persisted state to compute, that computation belongs in a Service or Action, which then passes the result into the Value Object.
 
+## Configuration Should Be Injected at the Boundary
+
+The same principle extends to configuration, not just HTTP/session context. Business logic (Services and Actions) should receive configuration values through constructor injection or method arguments, rather than calling `config()` directly throughout the codebase.
+
+### Bad
+
+```php
+class InvoiceService
+{
+    public function calculateLateFee(Invoice $invoice): float
+    {
+        $rate = config('billing.late_fee_rate'); // hidden dependency on global config
+
+        return $invoice->total * $rate;
+    }
+}
+```
+
+### Good
+
+```php
+class InvoiceService
+{
+    public function __construct(private readonly float $lateFeeRate) {}
+
+    public function calculateLateFee(Invoice $invoice): float
+    {
+        return $invoice->total * $this->lateFeeRate;
+    }
+}
+```
+
+Bind the concrete value in a Service Provider, or pass it in from the Controller/Console Command boundary. This keeps the class's dependencies explicit and makes it trivial to test with different configuration values, without needing `Config::set()` gymnastics in every test.
+
+Limit direct `config()` usage to infrastructure classes (Middleware, Service Providers, Controllers, Console Commands, Jobs at the point of dispatch). See "Configuration" below for the broader never-hardcode-values rule this builds on.
+
 ## Allowed Context Retrieval Exceptions:
 You may retrieve HTTP/UI/session context only within specific Laravel infrastructure classes:
 - Middleware
@@ -317,6 +353,27 @@ class CreateUserAction
     }
 }
 ```
+
+## Action Dependencies
+
+Actions should remain focused on a single business operation. An Action may depend on:
+- other small helper services (non-orchestrating utilities)
+- repositories (when used)
+- value objects
+
+Avoid Actions calling other Actions to build up larger workflows — that's workflow orchestration, and it belongs in a Service. The `UserOnboardingService` example above is the preferred shape: a Service coordinates several independent Actions, and none of those Actions call each other directly.
+
+### Avoid
+
+```
+CreateUserAction
+    ↓ (calls)
+AssignRoleAction
+    ↓ (calls)
+SendWelcomeEmailAction
+```
+
+If Actions start chaining into each other, they've effectively become a Service with a different name — extract that chain into a Service and let each Action stay independently callable.
 
 ## Services
 
@@ -487,6 +544,23 @@ class User extends Model
 ```
 
 Never mass-assign fields that control authorization, ownership, or financial state (e.g. `role`, `is_admin`, `balance`) through user-supplied input. Set these explicitly in the Action, not via `create($request->all())`.
+
+## Model Events / Observers
+
+Avoid placing business workflows inside Eloquent model events (`booted()`, `creating`, `saved`, etc.) or Observers.
+
+Good uses:
+- cache invalidation
+- audit logging
+- setting derived/computed attributes (e.g. a slug, a timestamp)
+
+Avoid:
+- sending emails
+- payment processing
+- external API calls
+- cross-domain workflows (e.g. an `Order` model event that touches `Inventory` or `Billing`)
+
+Model events fire implicitly on every save, from anywhere in the codebase — including console commands, seeders, and tests — which makes workflows hidden there hard to trace, hard to disable selectively, and easy to trigger by accident. Prefer explicit Actions, Services, or Domain Events for anything beyond the "good uses" above, so the workflow is visible at the call site instead of buried in a `booted()` method.
 
 ---
 
@@ -799,6 +873,24 @@ UpdateForecastData
 
 Avoid passing huge arrays.
 
+## Arrays vs. DTOs at Layer Boundaries
+
+Separately from the parameter-count trigger above: avoid passing associative arrays between Services and Actions for data that represents a business concept, even when it's a single parameter. An array has no enforced shape — it's undocumented, untyped, and only fails at runtime if a key is missing or misspelled.
+
+### Bad
+
+```php
+public function handle(array $data): Order
+```
+
+### Good
+
+```php
+public function handle(CreateOrderData $data): Order
+```
+
+This reinforces the Framework Independence principle: a DTO makes the data a class's dependencies actually need explicit and typed, rather than an opaque bag of whatever the caller happened to have on hand.
+
 ---
 
 # Enums
@@ -890,11 +982,9 @@ Use descriptive prefixes for boolean methods to return clearly identifiable true
 
 # Method Size
 
-Aim for:
+Line count is a poor metric for method quality on its own — it's the same reasoning already applied to Service and Class Size above.
 
-- 10–30 lines
-
-If a method exceeds ~50 lines, consider refactoring.
+Methods should fit comfortably on one screen and express one clear idea. Extract helper methods when doing so improves readability or reveals a reusable concept, not simply to satisfy an arbitrary line count. A 40-line method that reads top-to-bottom as one coherent step isn't automatically worse than three 12-line methods that only make sense read together.
 
 ---
 
@@ -1065,6 +1155,12 @@ DB::transaction(function () {
 
 Avoid performing external API calls (Stripe, HubSpot, third-party sync, etc.) inside a database transaction whenever possible. Commit the transaction first, then dispatch jobs or events that trigger external calls. Holding a database lock while waiting on a third-party network response is a common source of contention and can hold up unrelated queries for the duration of the external call.
 
+## Transaction Ownership
+
+Only the outermost orchestration layer (typically a Service) should open a `DB::transaction()`. Actions should assume they are already executing inside the correct transactional context and should not wrap their own work in a transaction unless they are genuinely called standalone, outside any Service.
+
+Avoid nested `DB::transaction()` calls unless isolation is intentionally required — Laravel's nested transactions use savepoints, and an inner rollback doesn't behave the way people often assume it does. If an Action needs transactional safety when invoked on its own, and also needs to compose cleanly inside a Service-level transaction, make the transaction boundary the caller's responsibility rather than baking it into the Action.
+
 ---
 
 # Queues
@@ -1078,6 +1174,44 @@ Queue work that involves any of the following:
 - any operation that would otherwise block the HTTP response for the user
 
 Do not queue trivial in-memory operations or single fast (< ~100ms) DB writes — the overhead of dispatching and processing a job exceeds the cost of doing it inline. When in doubt, measure before deciding.
+
+---
+
+# Jobs
+
+Jobs execute work asynchronously. A Job should coordinate existing Services or Actions, not duplicate business logic inside the Job class itself.
+
+### Bad
+
+```php
+class ProcessInvoiceJob implements ShouldQueue
+{
+    public function handle(): void
+    {
+        // validates
+        // queries
+        // calculates
+        // updates
+        // — all written inline, only reachable via the queue
+    }
+}
+```
+
+### Good
+
+```php
+class ProcessInvoiceJob implements ShouldQueue
+{
+    public function __construct(private readonly Invoice $invoice) {}
+
+    public function handle(InvoiceService $invoiceService): void
+    {
+        $invoiceService->process($this->invoice);
+    }
+}
+```
+
+Keeping the logic in the Service means it stays reusable and testable outside the queue (e.g. called synchronously from a Console Command or another workflow) instead of being locked inside a class that can only be exercised by dispatching a real or faked job.
 
 ---
 
@@ -1130,6 +1264,8 @@ Use:
 ```php
 config(...)
 ```
+
+in infrastructure classes (Service Providers, Controllers, Console Commands, Middleware). Inside Services and Actions, receive configuration values via constructor injection instead of calling `config()` directly — see "Configuration Should Be Injected at the Boundary" in Framework Independence.
 
 Never:
 
@@ -1326,6 +1462,27 @@ Route::apiResource('users', UserController::class);
 Group routes logically.
 
 Use middleware appropriately.
+
+---
+
+# Console Commands
+
+Console Commands are application entry points, parallel to Controllers.
+
+Commands should:
+- parse arguments and options
+- call Services or Actions
+- display output
+
+Commands should not contain business logic — the same rule that applies to Controllers applies here. A Command that validates, queries, calculates, and mutates inline is not reusable from anywhere except the CLI, and is difficult to test without invoking the full console kernel.
+
+---
+
+# Notifications
+
+Notifications should only format and deliver messages.
+
+Avoid business decisions inside Notifications — determine who should be notified and under what conditions in the calling Service or Action, before dispatching the Notification. The Notification class itself should not query the database to decide whether it's relevant, or branch on business state to decide what to say; it should receive what it needs to render the message.
 
 ---
 
