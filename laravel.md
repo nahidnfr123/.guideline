@@ -138,18 +138,35 @@ Service
     ↓
 Action
     ↓
-Repository
+Repository (optional layer — see "Repositories")
     ↓
 Model
 ```
 
+**Notes on this chain:**
+
+- The **Repository** layer is optional (see the Repositories section below). When a Repository does not exist for a given Model, Actions (or Services, in small projects — see below) may query the Model/`Model::query()` directly.
+- **Whether Services may query Models directly depends on project size** — see "Services and Data Access" below.
+- Controllers may only call Services or Actions — never Repositories or Models directly.
+
 ## Disallowed:
 
-- Controllers calling repositories directly
+- Controllers calling repositories or models directly
 - Models calling services
 - Models dispatching business workflows
 - Services depending on controllers
 - Circular dependencies between classes
+- Mixing patterns within the same entity — e.g. some Services querying `User` directly while others go through `UserAction` classes for the same model. Pick one approach per entity and stay consistent (see "Services and Data Access").
+
+## Services and Data Access
+
+This rule scales with the "Architecture Evolution" tier the project is in:
+
+- **Small projects** (flat structure, no Actions layer): Services may query Models directly. Keep it tight — if a single query is growing into 15+ lines of logic inline in a Service method, that's a signal the project has outgrown this tier; consider introducing an Actions layer for that slice of the app rather than letting the Service sprawl.
+
+- **Medium/large projects** (Actions layer present): once an Actions layer exists, Services must delegate data access to Actions rather than querying Models/Repositories directly. A Service's job is to orchestrate Actions (and other Services), not to touch persistence itself. If a Service needs a query no existing Action provides, add a new Action rather than reaching into the Model from the Service.
+
+Do not mix both approaches for the same entity within one project — if `OrderAction` classes exist, `OrderService` should use them instead of querying `Order` directly, even if it would be more convenient for one specific method.
 
 ---
 
@@ -241,13 +258,14 @@ public function store(StoreOrderRequest $request)
 
 ## Actions
 
-Actions represent a single business operation or use case.
+Actions represent a single business operation or use case, including data access for that operation.
 
 ### Characteristics:
 - One responsibility
 - One public `handle()` method
 - Easily testable
 - Reusable
+- May query the Model or Repository directly
 
 ### Examples:
 - `CreateUserAction`
@@ -269,12 +287,14 @@ class CreateUserAction
 
 ## Services
 
-Services coordinate multiple actions and orchestrate business workflows.
+Services coordinate multiple actions and orchestrate business workflows. They do not perform data access themselves.
 
 ### Characteristics:
 - Multiple methods allowed
 - Orchestrates business processes
-- Coordinates actions, repositories, jobs, and events
+- Coordinates actions, repositories (via actions), jobs, and events
+- In projects with an Actions layer: delegates data access to Actions rather than calling `Model::` directly (see "Services and Data Access")
+- In small projects with no Actions layer: may query Models directly, kept minimal
 
 ### Example:
 
@@ -307,7 +327,7 @@ Use a **Service** when:
 - The process includes transactions, events, notifications, or external integrations.
 
 ### Rule:
-- Business logic belongs in **Actions**.
+- Business logic and data access belong in **Actions**.
 - Workflow orchestration belongs in **Services**.
 
 ---
@@ -356,7 +376,7 @@ Controllers should not:
 
 # Services
 
-Services contain business logic and orchestration workflows.
+Services contain orchestration workflows, not raw data access (see "Actions vs Services").
 
 Each service should have a single responsibility.
 
@@ -369,7 +389,9 @@ PaymentService
 ForecastCalculationService
 ```
 
-Large services often indicate multiple responsibilities. Review any service exceeding ~300 lines. Refactor before it becomes difficult to understand.
+## Service Size
+
+Keep services under **300 lines**. Treat 300 lines as the point at which you actively review the class for split-worthy responsibilities — don't wait until it's unmanageable. This is the same limit referenced in "Class Size" below; services are not a special case.
 
 ---
 
@@ -390,6 +412,30 @@ Avoid:
 - Huge business logic
 - API calls
 - Complex calculations
+
+## Mass Assignment
+
+Always define `$fillable` explicitly on every Model. Do not use `$guarded = []`.
+
+### Bad
+
+```php
+class User extends Model
+{
+    protected $guarded = [];
+}
+```
+
+### Good
+
+```php
+class User extends Model
+{
+    protected $fillable = ['name', 'email', 'password'];
+}
+```
+
+Never mass-assign fields that control authorization, ownership, or financial state (e.g. `role`, `is_admin`, `balance`) through user-supplied input. Set these explicitly in the Action, not via `create($request->all())`.
 
 ---
 
@@ -539,6 +585,8 @@ Do not introduce repositories by default. Repositories are justified only when t
 
 Simple CRUD applications generally do not benefit from repositories.
 
+**When a Repository does not exist for a given Model, Actions query the Model directly** (`Model::query()`), and the dependency chain effectively becomes `Controller → Service → Action → Model`. Do not introduce a Repository purely to satisfy the layering diagram — only add one when one of the justifications above applies. If a Repository is later introduced for a Model, all Actions touching that Model should be migrated to use it, rather than mixing direct Model access and Repository access for the same entity.
+
 ---
 
 # Request Validation
@@ -578,6 +626,12 @@ InvoiceResource
 - Paginate collections.
 - Avoid exposing internal attributes.
 - Version public APIs when necessary.
+
+## API Versioning
+
+Version any API consumed by external clients or a separately-deployed frontend/mobile app. Use URL-based versioning (`/api/v1/...`) as the default approach; only deviate (header-based versioning, etc.) with explicit justification. Group versioned routes and controllers under a `V1`/`V2` namespace so breaking changes to `V2` don't touch `V1` code.
+
+Internal-only APIs consumed exclusively by a monolith's own frontend do not require versioning.
 
 ---
 
@@ -698,9 +752,13 @@ If a method exceeds ~50 lines, consider refactoring.
 
 Prefer:
 
-- under 300 lines
+- under 300 lines — treat this as the trigger to review the class for split-worthy responsibilities.
 
-Review classes larger than 500 lines.
+Refactor mandatorily:
+
+- classes larger than 500 lines must be split before merging, except where a maintainer explicitly signs off (e.g. large generated/DTO classes).
+
+This threshold applies uniformly to Services, Actions, Repositories, and Models — there is no separate limit per class type.
 
 ---
 
@@ -815,16 +873,15 @@ DB::transaction(function () {
 
 # Queues
 
-Queue:
+Queue work that involves any of the following:
 
-- emails
-- notifications
-- imports
-- exports
-- large calculations
-- external API synchronization
+- external API calls (payment gateways, third-party sync)
+- sending emails or notifications
+- imports/exports
+- calculations expected to take longer than ~1 second synchronously
+- any operation that would otherwise block the HTTP response for the user
 
-Never queue tiny operations.
+Do not queue trivial in-memory operations or single fast (< ~100ms) DB writes — the overhead of dispatching and processing a job exceeds the cost of doing it inline. When in doubt, measure before deciding.
 
 ---
 
@@ -888,6 +945,14 @@ Prefer:
 
 Every new business feature should include tests where practical.
 
+## Testing Conventions
+
+- **Feature tests** exercise the full stack (Controller → Service → Action → Model → DB) through HTTP or console entry points. Use these to verify authorization, validation, and response shape. Use model factories to set up state — do not hand-craft raw DB inserts.
+- **Unit tests** target a single Action or Service in isolation. Mock collaborators (other Actions, Services, external clients) using interfaces/constructor injection so the class under test has no hidden dependencies to fake.
+- Do not mock the Model/ORM layer itself in Unit tests — use an in-memory/test database (SQLite `:memory:` or a dedicated test DB) instead. Mocking Eloquent tends to produce tests that pass against a fake and fail against the real schema.
+- Policies and Gates should have dedicated authorization tests (allowed/denied cases), separate from Feature tests of the underlying endpoint.
+- Avoid testing framework internals (e.g. that Laravel's validator rejects a missing required field) — test your own business rules and edge cases.
+
 ---
 
 # Code Quality Tooling
@@ -942,6 +1007,7 @@ Always:
 - use Policies/Gates
 - hash passwords
 - never trust client input
+- define `$fillable` explicitly on every Model (see "Models → Mass Assignment")
 
 ---
 
@@ -1018,6 +1084,7 @@ Always:
 - add indexes
 - add foreign keys
 - make columns nullable only when necessary
+- implement a working `down()` method that reverses the `up()` — do not leave it empty unless the change is genuinely irreversible (in which case, comment why)
 
 Never modify old migrations after deployment.
 
@@ -1098,6 +1165,8 @@ When generating or modifying Laravel code:
 24. **Do not rename files or classes** unnecessarily.
 25. **Match the existing project's coding style**.
 26. **Avoid introducing additional dependencies** without justification.
+27. **In projects with an Actions layer, Services must not query Models/Repositories directly** — delegate data access to an Action. In small projects with no Actions layer, Services may query Models directly. Never mix both approaches for the same entity.
+28. **Define `$fillable` explicitly on every Model** — never use `$guarded = []`.
 
 ---
 
@@ -1108,6 +1177,7 @@ Before submitting code, verify:
 - [ ] PSR-12/PER compliant
 - [ ] No duplicated code
 - [ ] No business logic in controllers
+- [ ] No data access in Services where an Actions layer exists (delegated to Actions); direct Model access only used in small projects without one
 - [ ] Validation via Form Requests
 - [ ] Uses Resources for API responses
 - [ ] No N+1 queries
@@ -1122,3 +1192,5 @@ Before submitting code, verify:
 - [ ] No TODO left behind
 - [ ] No debug logging
 - [ ] New configuration documented
+- [ ] Model `$fillable` reviewed for new/changed columns
+- [ ] Migration `down()` method verified
