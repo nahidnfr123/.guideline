@@ -29,6 +29,28 @@ To build scalable, robust, and clean applications, adhere to these fundamental p
 
 ---
 
+# Business Rules
+
+Business rules belong in:
+
+- Actions
+- Services
+- Value Objects
+- Policies
+
+Business rules must never live inside:
+
+- Controllers
+- Blade templates
+- Routes
+- JavaScript/frontend code
+- Migrations
+- Factories/Seeders
+
+If a decision, calculation, or validation rule reflects how the business actually operates — pricing, eligibility, status transitions, permissions, limits — it belongs in one of the four locations above, expressed as a named, testable method. A rule duplicated across a Controller and a Console Command is a rule that was put in the wrong place the first time.
+
+---
+
 # Control Flow
 
 Prefer early returns over deeply nested conditionals. Keep nesting levels as shallow as possible, aiming to avoid more than 2-3 levels of nesting.
@@ -134,20 +156,21 @@ To maintain a clean codebase, adhere strictly to the following directional flow 
 ```
 Controller
     ↓
-Service
+Application Layer  (Service, or Action, or Service → Action)
     ↓
-Action
-    ↓
-Repository (optional layer — see "Repositories")
-    ↓
-Model
+Persistence  (Repository, if one exists — otherwise the Model directly)
 ```
+
+The Application Layer is not required to be both a Service *and* an Action. Depending on the project and the specific operation, it may be:
+
+- a **Service** alone (small projects, or simple orchestration with no reusable sub-steps),
+- an **Action** alone (a single Controller calling a single business operation directly), or
+- a **Service that delegates to Actions** (medium/large projects coordinating multiple reusable operations).
 
 **Notes on this chain:**
 
-- The **Repository** layer is optional (see the Repositories section below). When a Repository does not exist for a given Model, Actions (or Services, in small projects — see below) may query the Model/`Model::query()` directly.
-- **Whether Services may query Models directly depends on project size** — see "Services and Data Access" below.
-- Controllers may only call Services or Actions — never Repositories or Models directly.
+- The **Repository** layer is optional (see the Repositories section below). When a Repository does not exist for a given Model, the Application Layer may query the Model/`Model::query()` directly.
+- Controllers may only call the Application Layer (Services/Actions) — never Repositories or Models directly.
 
 ## Disallowed:
 
@@ -156,17 +179,12 @@ Model
 - Models dispatching business workflows
 - Services depending on controllers
 - Circular dependencies between classes
-- Mixing patterns within the same entity — e.g. some Services querying `User` directly while others go through `UserAction` classes for the same model. Pick one approach per entity and stay consistent (see "Services and Data Access").
 
 ## Services and Data Access
 
-This rule scales with the "Architecture Evolution" tier the project is in:
+Services should avoid data access when an equivalent Action already exists for that operation — reuse it rather than re-querying inline. But this is a preference for consistency, not a rigid layering rule: a `DashboardService` doing `User::count()` and `Order::count()` inline is fine; creating `CountUsersAction`/`CountOrdersAction` purely to satisfy a layering diagram adds ceremony without value.
 
-- **Small projects** (flat structure, no Actions layer): Services may query Models directly. Keep it tight — if a single query is growing into 15+ lines of logic inline in a Service method, that's a signal the project has outgrown this tier; consider introducing an Actions layer for that slice of the app rather than letting the Service sprawl.
-
-- **Medium/large projects** (Actions layer present): once an Actions layer exists, Services must delegate data access to Actions rather than querying Models/Repositories directly. A Service's job is to orchestrate Actions (and other Services), not to touch persistence itself. If a Service needs a query no existing Action provides, add a new Action rather than reaching into the Model from the Service.
-
-Do not mix both approaches for the same entity within one project — if `OrderAction` classes exist, `OrderService` should use them instead of querying `Order` directly, even if it would be more convenient for one specific method.
+The judgment call: if an Action for that query already exists, use it. If it doesn't, and creating one wouldn't be reused elsewhere, querying the Model directly from the Service is acceptable. Prefer consistency within a given entity's codepath over strict adherence to the "ideal" layering.
 
 ---
 
@@ -195,6 +213,16 @@ This covers not only `auth()`, but also other request concerns such as:
 - `url()`
 
 These are HTTP/UI concerns.
+
+## Value Objects Must Be Pure
+
+Value Objects have a stricter bar than Services/Actions: they must not perform I/O of any kind. In addition to the HTTP/session facades listed above, Value Objects must not use:
+- `config()`
+- `Cache::`
+- `Storage::`
+- `DB::`
+
+A Value Object should be fully constructible and usable from its constructor arguments alone, with no side effects and no reads from external state. If a value needs configuration or persisted state to compute, that computation belongs in a Service or Action, which then passes the result into the Value Object.
 
 ## Allowed Context Retrieval Exceptions:
 You may retrieve HTTP/UI/session context only within specific Laravel infrastructure classes:
@@ -287,14 +315,13 @@ class CreateUserAction
 
 ## Services
 
-Services coordinate multiple actions and orchestrate business workflows. They do not perform data access themselves.
+Services coordinate multiple actions and orchestrate business workflows. They should prefer delegating data access to Actions where a suitable one exists, but may query Models directly for simple, non-reusable operations (see "Services and Data Access").
 
 ### Characteristics:
 - Multiple methods allowed
 - Orchestrates business processes
 - Coordinates actions, repositories (via actions), jobs, and events
-- In projects with an Actions layer: delegates data access to Actions rather than calling `Model::` directly (see "Services and Data Access")
-- In small projects with no Actions layer: may query Models directly, kept minimal
+- Prefers reusing an existing Action for data access over querying the Model inline, but may query the Model directly for simple cases with no reuse benefit
 
 ### Example:
 
@@ -316,9 +343,11 @@ class UserOnboardingService
 
 ## Choosing Between an Action and a Service
 
+Not every project or every operation needs an Actions layer. Introduce Actions when a business operation becomes independently reusable — not simply because "that's the standard." A guideline that treats Actions as mandatory tends to produce noise like `GetUserAction`, `FindUserAction`, `DeleteUserAction`, `ArchiveUserAction` for every trivial CRUD verb, none of which are reused anywhere. That's ceremony, not architecture.
+
 Use an **Action** when:
 - The operation performs one business task.
-- The operation can be reused independently.
+- The operation is, or is likely to be, reused independently (called from more than one Controller, Service, Job, or Console Command).
 - The class naturally exposes a single `handle()` method.
 
 Use a **Service** when:
@@ -326,8 +355,11 @@ Use a **Service** when:
 - The workflow spans several business operations.
 - The process includes transactions, events, notifications, or external integrations.
 
+Use a **Service with no Actions** when:
+- The logic is simple orchestration or a single query/mutation with no independently reusable sub-steps. Don't manufacture an Action just to have one.
+
 ### Rule:
-- Business logic and data access belong in **Actions**.
+- Business logic and data access belong in **Actions** or **Services**, depending on reuse — see above.
 - Workflow orchestration belongs in **Services**.
 
 ---
@@ -374,6 +406,16 @@ Controllers should not:
 
 ---
 
+# Authorization
+
+Authorization belongs in Policies and Gates, invoked at the Controller/Form Request boundary (e.g. `$this->authorize(...)`, `Gate::authorize(...)` in a Controller, or a Form Request's `authorize()` method).
+
+Services and Actions assume the caller is already authorized. Do not call `Gate::allows()`, `Gate::authorize()`, `$user->can(...)`, or a Policy directly from inside a Service or Action — that re-introduces an HTTP/session concern into business logic and duplicates a check that should have already happened at the boundary.
+
+If a Service or Action needs to make an authorization-adjacent business decision (e.g. "can this order still be cancelled given its current state"), express that as a domain rule with a descriptive method (`$order->canBeCancelled()`), not as an authorization check.
+
+---
+
 # Services
 
 Services contain orchestration workflows, not raw data access (see "Actions vs Services").
@@ -391,7 +433,9 @@ ForecastCalculationService
 
 ## Service Size
 
-Keep services under **300 lines**. Treat 300 lines as the point at which you actively review the class for split-worthy responsibilities — don't wait until it's unmanageable. This is the same limit referenced in "Class Size" below; services are not a special case.
+A Service should have a single responsibility. Line count alone is not a reliable signal — a 320-line Service handling one cohesive workflow isn't automatically worse than four tiny Services bouncing calls between each other.
+
+When a Service becomes difficult to understand, navigate, or test, consider extracting Actions or splitting into additional Services. Large classes are a symptom of mixed responsibilities, not the problem itself — review for *what* the class is doing, not how many lines it takes to do it.
 
 ---
 
@@ -576,16 +620,18 @@ Register bindings in Service Providers.
 
 # Repositories
 
-Do not introduce repositories by default. Repositories are justified only when they provide meaningful abstraction, such as:
+Repositories exist to abstract persistence.
 
-- Multiple persistence implementations
-- External data sources
-- Reusable complex queries
-- Caching layers
+Do not create repositories simply to wrap Eloquent CRUD.
 
-Simple CRUD applications generally do not benefit from repositories.
+Repositories should only exist when they provide meaningful abstraction, such as:
 
-**When a Repository does not exist for a given Model, Actions query the Model directly** (`Model::query()`), and the dependency chain effectively becomes `Controller → Service → Action → Model`. Do not introduce a Repository purely to satisfy the layering diagram — only add one when one of the justifications above applies. If a Repository is later introduced for a Model, all Actions touching that Model should be migrated to use it, rather than mixing direct Model access and Repository access for the same entity.
+- multiple data sources
+- reusable complex queries
+- caching
+- external systems
+
+When no Repository exists for a Model, the Application Layer (Action or Service) queries the Model directly. If a Repository is later introduced for a Model, migrate all existing direct-Model-access code paths for that Model to use it, rather than mixing both approaches for the same entity.
 
 ---
 
@@ -637,7 +683,25 @@ Internal-only APIs consumed exclusively by a monolith's own frontend do not requ
 
 # DTOs
 
-Use DTOs for large service inputs.
+Prefer DTOs whenever a method receives more than 3–4 related parameters, or the parameters together represent a single business concept.
+
+### Bad
+
+```php
+public function create(
+    string $name,
+    string $email,
+    string $phone,
+    string $country,
+    string $city
+): User
+```
+
+### Good
+
+```php
+public function create(CreateUserData $data): User
+```
 
 ### Example
 
@@ -750,15 +814,14 @@ If a method exceeds ~50 lines, consider refactoring.
 
 # Class Size
 
-Prefer:
+For Actions, Repositories, and Models, line count is a useful early-warning signal:
 
-- under 300 lines — treat this as the trigger to review the class for split-worthy responsibilities.
+- **under 300 lines** — treat this as the trigger to review the class for split-worthy responsibilities.
+- **larger than 500 lines** — must be split before merging, except where a maintainer explicitly signs off (e.g. large generated/DTO classes).
 
-Refactor mandatorily:
+For **Services**, follow the responsibility-based guidance in "Service Size" above instead of a fixed threshold — a large Service that stays cohesive around one workflow is not automatically a problem, but drifting responsibilities are.
 
-- classes larger than 500 lines must be split before merging, except where a maintainer explicitly signs off (e.g. large generated/DTO classes).
-
-This threshold applies uniformly to Services, Actions, Repositories, and Models — there is no separate limit per class type.
+In all cases: treat size as a symptom to investigate, not a rule to satisfy by mechanically splitting a class.
 
 ---
 
@@ -859,6 +922,46 @@ Use custom exceptions where appropriate.
 
 ---
 
+# Side Effects
+
+Separate calculations from side effects whenever practical.
+
+Pure methods — ones whose purpose is to compute or decide something — should not:
+
+- send emails
+- write logs
+- dispatch jobs or events
+- mutate unrelated models
+- perform other I/O
+
+### Bad
+
+```php
+public function calculateDiscount(Order $order): float
+{
+    $discount = $order->total * 0.1;
+
+    Log::info('Discount calculated', ['order_id' => $order->id]); // side effect in a calculation
+
+    $order->update(['discount_applied' => true]); // mutates unrelated state
+
+    return $discount;
+}
+```
+
+### Good
+
+```php
+public function calculateDiscount(Order $order): float
+{
+    return $order->total * 0.1;
+}
+```
+
+The caller (an Action or Service orchestrating the workflow) is responsible for logging, dispatching, and persisting — not the calculation itself. This makes pure logic trivially unit-testable without mocks, and makes it obvious, when reading a method, whether calling it twice is safe.
+
+---
+
 # Transactions
 
 Wrap multi-step database operations.
@@ -890,6 +993,36 @@ Do not queue trivial in-memory operations or single fast (< ~100ms) DB writes �
 Use events when multiple listeners need to react.
 
 Avoid events for simple sequential code.
+
+## Domain Events
+
+Prefer domain events over tightly coupling unrelated services to one another.
+
+### Bad
+
+```
+OrderService
+    ↓ (directly calls)
+EmailService
+    ↓ (directly calls)
+SlackService
+    ↓ (directly calls)
+CRMService
+```
+
+### Good
+
+```
+OrderCreated event
+    ↓
+SendOrderConfirmationEmail listener
+UpdateCrmRecord listener
+NotifySlackChannel listener
+```
+
+The triggering Service (`OrderService`) only needs to know that an order was created and dispatch the event — it should not know or care who reacts to it, or how many listeners exist. This keeps unrelated concerns (email, CRM sync, Slack notifications) decoupled and independently testable, and lets new reactions be added without modifying `OrderService`.
+
+Use direct calls (not events) when the caller genuinely needs the result of the operation synchronously, or when there is exactly one tightly-related consequence that will realistically never need to vary independently.
 
 ---
 
@@ -1165,8 +1298,10 @@ When generating or modifying Laravel code:
 24. **Do not rename files or classes** unnecessarily.
 25. **Match the existing project's coding style**.
 26. **Avoid introducing additional dependencies** without justification.
-27. **In projects with an Actions layer, Services must not query Models/Repositories directly** — delegate data access to an Action. In small projects with no Actions layer, Services may query Models directly. Never mix both approaches for the same entity.
+27. **Services should prefer reusing an existing Action for data access over re-querying inline** — but this is a consistency preference, not a rigid ban; simple, non-reusable queries may live directly in a Service (see "Services and Data Access").
 28. **Define `$fillable` explicitly on every Model** — never use `$guarded = []`.
+29. **Do not introduce an Actions layer, Repository, or other abstraction merely because this document mentions it** — introduce it when the stated justification (reuse, multiple data sources, complex queries, caching, etc.) actually applies. Unjustified abstraction is itself a violation of these standards.
+30. **Never generate code that violates this document merely because it is shorter or faster to produce.** Architecture and correctness are preferred over brevity — do not skip Form Requests, Resources, Policies, or DTOs to save a few lines.
 
 ---
 
@@ -1176,8 +1311,9 @@ Before submitting code, verify:
 
 - [ ] PSR-12/PER compliant
 - [ ] No duplicated code
-- [ ] No business logic in controllers
-- [ ] No data access in Services where an Actions layer exists (delegated to Actions); direct Model access only used in small projects without one
+- [ ] No business logic in controllers, Blade, routes, migrations, or factories (see "Business Rules")
+- [ ] Services reuse existing Actions for data access where one already exists; direct Model queries only used where no equivalent Action exists
+- [ ] Authorization performed via Policies/Gates at the Controller/Form Request boundary — not inside Services or Actions
 - [ ] Validation via Form Requests
 - [ ] Uses Resources for API responses
 - [ ] No N+1 queries
