@@ -24,6 +24,7 @@ Default stack:
 - Zod
 - TailwindCSS
 - Shadcn UI (preferred UI library)
+- Zustand (global client state — auth, theme, feature flags only)
 
 ---
 
@@ -75,11 +76,13 @@ src/
 ├── shared/
 │   ├── api/
 │   ├── components/
+│   ├── config/
 │   ├── hooks/
-│   ├── utils/
+│   ├── lib/
+│   ├── store/
 │   ├── types/
 │   ├── constants/
-│   └── lib/
+│   └── utils/
 │
 ├── assets/
 ├── styles/
@@ -112,6 +115,8 @@ users/
     services/
 
     schemas/
+
+    store/        (only if the domain owns global state, e.g. auth)
 
     types/
 
@@ -254,6 +259,45 @@ Always:
 - use query keys
 - use optimistic updates where appropriate
 
+## Query Keys
+
+Every domain defines its query keys in a single file, following a fixed hierarchy: `all` → `lists`/`details` → specific filters/ids. Never inline raw arrays as query keys inside components or hooks.
+
+```ts
+// domains/users/api/query-keys.ts
+export const userKeys = {
+  all: ['users'] as const,
+  lists: () => [...userKeys.all, 'list'] as const,
+  list: (filters: UserFilters) => [...userKeys.lists(), filters] as const,
+  details: () => [...userKeys.all, 'detail'] as const,
+  detail: (id: string) => [...userKeys.details(), id] as const,
+};
+```
+
+Usage
+
+```ts
+// query
+useQuery({ queryKey: userKeys.detail(userId), queryFn: () => getUser(userId) });
+
+// invalidate all user lists after a mutation
+queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+
+// invalidate everything user-related
+queryClient.invalidateQueries({ queryKey: userKeys.all });
+```
+
+Bad
+
+```ts
+useQuery({ queryKey: ['users', userId], queryFn: ... }); // inconsistent shape, not reusable for invalidation
+```
+
+Rules:
+
+- Query key factories live in `domains/<domain>/api/query-keys.ts`, exported from the domain's `index.ts` only if another domain legitimately needs to invalidate them (rare — prefer events/callbacks instead).
+- Filters/params passed into a list key must be the same normalized object used in the query function, so cache entries don't fragment.
+
 ---
 
 # API Layer
@@ -300,6 +344,58 @@ A service may call multiple API endpoints.
 
 ---
 
+# Application Layers
+
+The call chain is fixed and must not be skipped:
+
+```
+Component → Hook → Service → API layer → HTTP
+```
+
+- **Component** — renders UI, calls a hook, nothing else.
+- **Hook** — owns TanStack Query (`useQuery`/`useMutation`), local state, and calls a service. This is the only place a component talks to.
+- **Service** — pure functions that orchestrate one or more API calls, combine results, apply business rules. No React, no hooks, no query state.
+- **API layer** — thin wrappers around Axios. One function per endpoint. No business logic.
+
+A hook may call the API layer directly **only** when the operation is a single, unmodified request with no orchestration (e.g. `useUsers()` calling `getUsers()` directly is fine). As soon as a second endpoint, a transformation, or a business rule is involved, extract a service.
+
+Bad — hook skips the service layer for a multi-step operation
+
+```ts
+function useCreateOrder() {
+  return useMutation({
+    mutationFn: async (input: CreateOrderInput) => {
+      const cart = await api.get(`/carts/${input.cartId}`);
+      const order = await api.post('/orders', { ...input, items: cart.data.items });
+      await api.post(`/carts/${input.cartId}/clear`);
+      return order.data;
+    },
+  });
+}
+```
+
+Good — orchestration lives in the service
+
+```ts
+// domains/orders/services/order.service.ts
+export async function createOrderFromCart(input: CreateOrderInput) {
+  const cart = await getCart(input.cartId);
+  const order = await createOrder({ ...input, items: cart.items });
+  await clearCart(input.cartId);
+  return order;
+}
+
+// domains/orders/hooks/use-create-order.ts
+export function useCreateOrder() {
+  return useMutation({
+    mutationFn: createOrderFromCart,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: orderKeys.all }),
+  });
+}
+```
+
+---
+
 # Forms
 
 Always use
@@ -337,13 +433,29 @@ Prefer:
 
 Avoid global state unless necessary.
 
-Global state is for:
+## Global State
 
-- authentication
-- theme
-- feature flags
+Global state is limited to authentication, theme, and feature flags — never server data. Use **Zustand** for these; do not use Context for state that changes over time (Context is fine only for static, rarely-changing values like a theme *config* injected once).
 
-Not for server data.
+```ts
+// domains/auth/store/auth.store.ts
+type AuthState = {
+  user: User | null;
+  setUser: (user: User | null) => void;
+  logout: () => void;
+};
+
+export const useAuthStore = create<AuthState>((set) => ({
+  user: null,
+  setUser: (user) => set({ user }),
+  logout: () => set({ user: null }),
+}));
+```
+
+Rules:
+
+- One store per concern (`auth.store.ts`, `theme.store.ts`, `feature-flags.store.ts`) — no single monolithic app store.
+- Stores live inside the domain they belong to (`domains/auth/store`), except cross-cutting ones like theme/feature-flags, which live in `shared/store`.
 
 ---
 
@@ -400,6 +512,8 @@ Review components over
 Split components over
 
 500 lines
+
+Split by extracting sub-components first (tables, modals, form sections), then by extracting hooks if the remaining logic is still heavy. A component that's long because it renders many distinct UI regions should become several presentational components; a component that's long because of state/effects/handlers should push that logic into a hook.
 
 ---
 
@@ -466,6 +580,8 @@ AuthLayout
 SettingsLayout
 ```
 
+Every layout wraps its children in an Error Boundary (see **Error Handling**).
+
 ---
 
 # Loading States
@@ -483,6 +599,83 @@ Avoid blank pages.
 Always display meaningful errors.
 
 Never silently fail.
+
+---
+
+# Error Handling
+
+## Typed API Errors
+
+Never let a raw Axios error reach a component. Transform it in the API layer into a typed shape.
+
+```ts
+// shared/api/api-error.ts
+export type ApiError = {
+  status: number;
+  message: string;
+  code?: string;
+};
+
+export function toApiError(error: unknown): ApiError {
+  if (axios.isAxiosError(error)) {
+    return {
+      status: error.response?.status ?? 0,
+      message: error.response?.data?.message ?? 'Unexpected error',
+      code: error.response?.data?.code,
+    };
+  }
+  return { status: 0, message: 'Unexpected error' };
+}
+```
+
+```ts
+// domains/users/api/user.api.ts
+export async function getUser(id: string) {
+  try {
+    const { data } = await api.get<User>(`/users/${id}`);
+    return data;
+  } catch (error) {
+    throw toApiError(error);
+  }
+}
+```
+
+## Query/Mutation Errors
+
+Handle expected errors at the hook or component level via TanStack Query's `error` state. Use a global `QueryCache`/`MutationCache` `onError` only for unexpected/unhandled errors (e.g. to fire a generic toast or log to the monitoring service).
+
+```ts
+// app/providers/query-client.ts
+export const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) => {
+      if (query.meta?.silent) return;
+      logger.error('Query failed', { error, queryKey: query.queryKey });
+    },
+  }),
+  mutationCache: new MutationCache({
+    onError: (error) => {
+      toast.error(isApiError(error) ? error.message : 'Something went wrong');
+    },
+  }),
+});
+```
+
+## Error Boundaries
+
+Every layout in `app/layouts` wraps its children in an Error Boundary. Boundaries catch render errors, not query errors — query errors are handled by TanStack Query as above.
+
+```tsx
+// app/layouts/dashboard-layout.tsx
+<ErrorBoundary fallback={<DashboardErrorFallback />}>
+  <Outlet />
+</ErrorBoundary>
+```
+
+Rules:
+
+- Never display a raw `error.message` from an unknown/unhandled error to the user; map known `ApiError.code` values to friendly copy, and fall back to a generic message otherwise.
+- Every mutation that changes data must handle its `onError` case, even if only to show a toast.
 
 ---
 
@@ -541,6 +734,37 @@ instead of
 ```
 
 throughout the project.
+
+---
+
+# Environment Configuration
+
+All environment variables are validated at boot via a Zod schema. Never read `import.meta.env.*` directly outside this file.
+
+```ts
+// shared/config/env.ts
+const envSchema = z.object({
+  VITE_API_URL: z.string().url(),
+  VITE_APP_ENV: z.enum(['development', 'staging', 'production']),
+});
+
+export const env = envSchema.parse(import.meta.env);
+```
+
+Bad
+
+```ts
+const apiUrl = import.meta.env.VITE_API_URL; // no validation, no type safety
+```
+
+Good
+
+```ts
+import { env } from '@shared/config/env';
+api.defaults.baseURL = env.VITE_API_URL;
+```
+
+If validation fails, the app should fail fast at startup with a clear console error rather than surface a confusing runtime bug later.
 
 ---
 
@@ -627,11 +851,11 @@ Prefer
 
 type
 
-for DTOs.
+for DTOs (API payloads, request/response shapes).
 
 interface
 
-for contracts.
+for contracts (props, service/class public APIs — anything meant to be extended or implemented).
 
 ---
 
@@ -671,6 +895,18 @@ Types
 
 ```
 user.types.ts
+```
+
+Query Keys
+
+```
+query-keys.ts
+```
+
+Store
+
+```
+auth.store.ts
 ```
 
 ---
@@ -763,6 +999,20 @@ Test:
 
 Avoid snapshot-heavy testing.
 
+## Testing Requirements
+
+Minimum bar, enforced in PR review:
+
+| Layer | Required? |
+|---|---|
+| Services | Required |
+| Hooks (business logic, not pure passthroughs) | Required |
+| Zod schemas (edge cases) | Required |
+| Presentational components | Optional |
+| Pages | Optional (covered by e2e if present) |
+
+Avoid snapshot-heavy testing; assert on behavior (rendered text, called handlers, resulting state) rather than serialized markup.
+
 ---
 
 # Code Quality
@@ -779,13 +1029,39 @@ Required
 
 # Logging
 
-Never use
+`console.log` is banned in application code (ESLint rule: `no-console`, error level). Use the shared logger.
 
-```
-console.log()
+```ts
+// shared/lib/logger.ts
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+function log(level: LogLevel, message: string, context?: Record<string, unknown>) {
+  if (import.meta.env.DEV) {
+    console[level === 'debug' ? 'log' : level](`[${level.toUpperCase()}] ${message}`, context ?? '');
+    return;
+  }
+  // production: forward to monitoring (Sentry, LogRocket, etc.)
+  monitoringClient.capture(level, message, context);
+}
+
+export const logger = {
+  debug: (message: string, context?: Record<string, unknown>) => log('debug', message, context),
+  info: (message: string, context?: Record<string, unknown>) => log('info', message, context),
+  warn: (message: string, context?: Record<string, unknown>) => log('warn', message, context),
+  error: (message: string, context?: Record<string, unknown>) => log('error', message, context),
+};
 ```
 
-Use a logging utility.
+Usage
+
+```ts
+logger.error('Failed to create order', { orderId, error });
+```
+
+Rules:
+
+- No `console.*` calls outside `shared/lib/logger.ts` itself.
+- Never log tokens, passwords, or full request/response bodies containing PII.
 
 ---
 
@@ -795,11 +1071,11 @@ When generating React code:
 
 1. Follow domain architecture.
 2. Never place business logic inside components.
-3. Use TanStack Query for server state.
+3. Use TanStack Query for server state, with query keys from a domain's `query-keys.ts`.
 4. Use React Hook Form with Zod.
 5. Keep page components thin.
 6. Create reusable hooks.
-7. Create reusable services.
+7. Create reusable services; hooks call services, services call the API layer (see **Application Layers**).
 8. Never call Axios directly from components.
 9. Prefer composition.
 10. Reuse existing components before creating new ones.
@@ -811,8 +1087,11 @@ When generating React code:
 16. Do not introduce unnecessary dependencies.
 17. Prefer refactoring over rewriting.
 18. Keep UI components presentational.
-19. Separate server state from UI state.
-20. Never violate these standards simply because a shorter implementation exists.
+19. Separate server state from UI state; use Zustand only for auth/theme/feature flags.
+20. Type and map errors before they reach the UI; never leak raw error messages.
+21. Use the shared `logger`, never `console.*`.
+22. Validate environment variables through `shared/config/env.ts`.
+23. Never violate these standards simply because a shorter implementation exists.
 
 ---
 
@@ -826,12 +1105,15 @@ Before merging:
 - [ ] No `any`
 - [ ] No duplicate components
 - [ ] No business logic in components
-- [ ] API calls only through services/API layer
-- [ ] TanStack Query used for server state
+- [ ] API calls only through the API layer; orchestration only in services
+- [ ] TanStack Query used for server state, with query keys from a domain's `query-keys.ts`
 - [ ] Forms use React Hook Form + Zod
+- [ ] Errors are typed and mapped to user-facing messages; no raw error leaks to UI
+- [ ] Mutations handle `onError`
+- [ ] No `console.*`; uses `logger`
+- [ ] New env vars added to `env.ts` schema
 - [ ] Components remain small and reusable
 - [ ] No unnecessary re-renders
 - [ ] No dead code
 - [ ] No unused imports
-- [ ] No console.log
-- [ ] Tests updated where applicable
+- [ ] Tests updated for services/hooks/schemas per Testing Requirements
