@@ -156,7 +156,7 @@ To maintain a clean codebase, adhere strictly to the following directional flow 
 ```
 Controller (HTTP/CLI Request Boundary)
     │
-    ▼ [Rule: Controllers must NEVER bypass the Application Layer to touch Persistence directly]
+    ▼
 Application Layer (Service, Action, or Service delegating to Action)
     │
     ▼
@@ -171,6 +171,7 @@ The Application Layer is not required to be both a Service *and* an Action. Depe
 
 **Notes on this chain:**
 
+- Controllers must never bypass the Application Layer to touch Persistence directly.
 - The **Repository** layer is optional (see the Repositories section below). When a Repository does not exist for a given Model, the Application Layer may query the Model/`Model::query()` directly.
 - Controllers may only call the Application Layer (Services/Actions) — never Repositories or Models directly.
 
@@ -670,9 +671,9 @@ $request->validate(...)
 
 inside controllers.
 
-## Organisation of Form Requests
+## Organization of Form Requests
 
-In larger projects, avoid a flat list of classes in `app/Http/Requests`. Organise requests logically:
+In larger projects, avoid a flat list of classes in `app/Http/Requests`. Organize requests logically:
 - **By Resource/Feature:** Group them into subdirectories under `app/Http/Requests`, e.g.:
   - `app/Http/Requests/User/StoreUserRequest.php`
   - `app/Http/Requests/User/UpdateUserRequest.php`
@@ -1370,7 +1371,6 @@ Before submitting code, verify:
 - [ ] Validation via Form Requests
 - [ ] Uses Resources for API responses
 - [ ] No N+1 queries
-- [ ] Proper authorization implemented
 - [ ] Transactions where required
 - [ ] Logging instead of debug statements
 - [ ] Tests updated or added where applicable
