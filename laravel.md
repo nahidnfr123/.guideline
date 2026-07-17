@@ -485,6 +485,27 @@ Never mass-assign fields that control authorization, ownership, or financial sta
 
 ---
 
+# Soft Deletes & Auditing
+
+## Soft Deletes
+
+Use Soft Deletes only when business requirements dictate that deleted data must be restorable or kept for auditing.
+- **Global Scopes:** Be aware of default global scopes (e.g., `withoutTrashed()`) when querying relations. Use `withTrashed()` explicitly when you need to load deleted models.
+- **Unique Validation:** Standard unique rules will fail if a soft-deleted row exists with the same value. Customize validation rules to ignore/include trashed records appropriately.
+
+## Global Scopes
+
+- Avoid complex global scopes that implicitly alter query outcomes across the application, as they can cause bugs and complicate unit testing.
+- Prefer explicit local query scopes (e.g., `scopeActive($query)`) that developers call consciously.
+
+## Activity Logging & Auditing
+
+- Audit critical data mutations, status changes, and user authorization updates.
+- Use established packages (e.g., `spatie/laravel-activitylog`) rather than custom DB listeners.
+- Always log full metadata: the actor (user), the target model, key changed fields (before/after), and contextual request metadata (like IP, session, or CLI context).
+
+---
+
 # Validation
 
 Always use Form Requests.
@@ -689,6 +710,24 @@ InvoiceResource
 Version any API consumed by external clients or a separately-deployed frontend/mobile app. Use URL-based versioning (`/api/v1/...`) as the default approach; only deviate (header-based versioning, etc.) with explicit justification. Group versioned routes and controllers under a `V1`/`V2` namespace so breaking changes to `V2` don't touch `V1` code.
 
 Internal-only APIs consumed exclusively by a monolith's own frontend do not require versioning.
+
+## API Error Responses
+
+Avoid returning inconsistent error structures. Use a standardized JSON structure for all API errors.
+
+### Standard Format:
+```json
+{
+    "message": "The given data was invalid.",
+    "errors": {
+        "email": [
+            "The email field is required."
+        ]
+    }
+}
+```
+
+Recommend customizing exception rendering in `bootstrap/app.php` (Laravel 11+) or the global Exception Handler to guarantee that all API exceptions (e.g. `ValidationException`, `ModelNotFoundException`, `AuthenticationException`) are converted to this standard response structure automatically.
 
 ---
 
@@ -1091,11 +1130,14 @@ Every new business feature should include tests where practical.
 
 ## Testing Conventions
 
+- **Database State Management:** Use the `RefreshDatabase` trait (for full DB reset on each run) or `DatabaseTransactions` trait (to roll back changes automatically) to ensure tests run in isolation and maintain a clean state.
+- **Database Assertions:** In Feature tests, prefer calling `assertDatabaseHas` and `assertDatabaseMissing` to verify side effects of logic execution, rather than manually checking counts or records.
+- **Mocking External Services:** Avoid actual network calls. Mock external integrations using native Laravel fakes (e.g. `Http::fake()`, `Queue::fake()`, `Mail::fake()`, `Event::fake()`, `Storage::fake()`) or bind mock class implementations to interfaces in the service container.
 - **Feature tests** exercise the full stack (Controller → Service → Action → Model → DB) through HTTP or console entry points. Use these to verify authorization, validation, and response shape. Use model factories to set up state — do not hand-craft raw DB inserts.
 - **Unit tests** target a single Action or Service in isolation. Mock collaborators (other Actions, Services, external clients) using interfaces/constructor injection so the class under test has no hidden dependencies to fake.
-- Do not mock the Model/ORM layer itself in Unit tests — use an in-memory/test database (SQLite `:memory:` or a dedicated test DB) instead. Mocking Eloquent tends to produce tests that pass against a fake and fail against the real schema.
-- Policies and Gates should have dedicated authorization tests (allowed/denied cases), separate from Feature tests of the underlying endpoint.
-- Avoid testing framework internals (e.g. that Laravel's validator rejects a missing required field) — test your own business rules and edge cases.
+- **Do not mock the Model/ORM layer itself** in Unit tests — use an in-memory/test database (SQLite `:memory:` or a dedicated test DB) instead. Mocking Eloquent tends to produce tests that pass against a fake and fail against the real schema.
+- **Policies and Gates** should have dedicated authorization tests (allowed/denied cases), separate from Feature tests of the underlying endpoint.
+- **Avoid testing framework internals** (e.g. that Laravel's validator rejects a missing required field) — test your own business rules and edge cases.
 
 ---
 
