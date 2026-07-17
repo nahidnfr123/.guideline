@@ -132,10 +132,16 @@ src/
     └── products/
 ```
 
-## Domain Boundaries
+## Domain Boundaries & Folder Ownership
+
+**A domain owns everything inside its folder.** Only the domain's public exports may be imported by other domains, and no domain may modify another domain's internal files — an engineer (or an AI assistant) working inside `domains/orders` should never edit a file inside `domains/users`.
 
 - Each domain exposes a single public surface through its `index.ts` (routes + any types other domains legitimately need). Everything else inside a domain folder is private to that domain.
 - **A domain must not import another domain's `services/`, `repositories/`, `actions/`, or `models/` directly.** If domain A genuinely needs domain B's behavior, it goes through B's exported service interface (from `domains/orders/index.ts`), or the two communicate via a domain event.
+- Cross-domain communication happens only through:
+  - the target domain's public interface (its `index.ts` exports)
+  - an exported Service method (never an Action, Repository, or Model directly)
+  - a domain event
 - Cross-cutting concerns (auth guard, request ID, logging) live in top-level `middleware/`, not duplicated per domain.
 - A domain folder is not required to populate every subfolder — an `orders` domain with no caching need has no `policies/` folder just to match the template. Create subfolders when the domain has content for them (see "No Ceremony" principle below, mirrored from the Laravel `Actions` guidance).
 
@@ -696,6 +702,38 @@ A Service instance shared across requests must not hold per-request mutable stat
 
 ---
 
+# Composition Root
+
+Application assembly happens **once**, in a single, identifiable place — typically `app.ts`/`server.ts` plus a `container.ts` — never scattered across the codebase.
+
+The composition root, and only the composition root, is responsible for:
+
+- Dependency injection registration (binding interfaces to concrete implementations)
+- Router registration (mounting each domain's router onto the app)
+- Configuration loading (invoking the validated config module — see "Configuration")
+- Middleware registration (global middleware order: request ID → logging → body parsing → routes → error handler)
+- Infrastructure initialization (opening the DB connection pool, connecting the Redis client, constructing third-party API clients)
+
+```ts
+// container.ts — composition root
+export function buildContainer() {
+  const env = loadConfig();
+  const db = createDbClient(env.DATABASE_URL);
+  const cache = createRedisClient(env.REDIS_URL);
+  const emailClient: EmailClient = createSesClient(env.AWS_REGION);
+
+  const userRepository = new PrismaUserRepository(db);
+  const createUserAction = new CreateUserAction(userRepository);
+  const userService = new UserOnboardingService(createUserAction, emailClient);
+
+  return { userService /* ...other domain services */ };
+}
+```
+
+**Business logic must never register dependencies dynamically.** A Service or Action must not reach into a container to resolve something at runtime, conditionally construct a different implementation based on business state, or lazily instantiate an infrastructure client on first use. If a dependency is needed, it was missing from the constructor — fix the composition root, don't work around it from inside business logic.
+
+---
+
 # Repositories
 
 Repositories exist to abstract persistence. Do not create a Repository simply to wrap ORM CRUD 1:1.
@@ -707,6 +745,41 @@ Repositories should exist when they provide meaningful abstraction:
 - An external system pretending to be a data source
 
 When no Repository exists for a Model, the Application Layer queries the ORM directly. If a Repository is later introduced for a Model, migrate all existing direct-access code paths for that entity to use it — don't leave the same Model queried two different ways across the codebase.
+
+---
+
+# ORM Independence
+
+The architecture must not depend on a specific ORM. Whether the project uses Prisma, TypeORM, Drizzle, Sequelize, Mongoose, or MikroORM, the architectural rules in this document remain identical — this document's code examples use Prisma purely for illustration, not as an endorsement.
+
+- Repositories (when used), Services, Actions, DTOs, Policies, Resources, and Controllers should never expose ORM-specific types outside their intended boundary. A Prisma `User` model, a TypeORM entity, or a Mongoose document should not leak past the Repository/Model layer into a Controller, a DTO, or an API response — map it to a plain domain type or a Resource first.
+- Avoid leaking ORM-specific implementation details into business logic: no `Prisma.UserWhereInput` typed parameters on a Service method, no TypeORM `QueryBuilder` passed into an Action, no Mongoose `Document` methods (`.save()`, `.populate()`) called from a Service.
+- If the project ever needs to swap ORMs, the change should be contained to the Repository/Model layer and the `infrastructure/` adapters that construct ORM clients — Services, Actions, Controllers, and DTOs should require no changes.
+
+---
+
+# Infrastructure Layer
+
+Infrastructure adapters are implementation details, not business concerns. Examples: Redis, S3, Stripe, HubSpot, SendGrid, Twilio.
+
+- Business logic (Services, Actions) should depend on an interface (`EmailClient`, `PaymentGateway`, `ObjectStorage`) defined in the domain or in `shared/`, not on a concrete provider's SDK.
+- The concrete provider implementation lives in `infrastructure/` and is bound to the interface at the Composition Root.
+- Business logic should not know or care which provider is being used — a Service that sends a confirmation email calls `emailClient.send(...)`, and has no idea whether that's SES, SendGrid, or Postmark underneath.
+- Switching providers (SendGrid → SES, Stripe → a different processor) should require changes only inside `infrastructure/` and the Composition Root binding — never inside a Service, Action, or Controller.
+
+```ts
+// shared/interfaces/email-client.ts — the contract business logic depends on
+export interface EmailClient {
+  send(to: string, subject: string, body: string): Promise<void>;
+}
+
+// infrastructure/email/ses-email-client.ts — the implementation detail
+export class SesEmailClient implements EmailClient {
+  async send(to: string, subject: string, body: string): Promise<void> {
+    // AWS SES SDK calls live here, and only here
+  }
+}
+```
 
 ---
 
@@ -920,6 +993,48 @@ Prefer an injectable service (even a small one) over a class of static methods w
 
 ---
 
+# Async Standards
+
+Prefer `async`/`await` over raw Promise chains — it reads top-to-bottom and produces stack traces that actually point at the failing line.
+
+### Good
+
+```ts
+const user = await userRepository.find(id);
+```
+
+### Avoid
+
+```ts
+userRepository
+  .find(id)
+  .then((user) => { /* ... */ })
+  .catch((err) => { /* ... */ });
+```
+
+- **Never forget to `await` an asynchronous call** unless intentionally firing it without waiting on the result (and if so, comment why, and still attach a `.catch()` so a rejection doesn't become an unhandled rejection).
+- When multiple independent operations can run concurrently, use `Promise.all()` (or `Promise.allSettled()` when partial failure is acceptable) instead of awaiting them one at a time in sequence.
+
+### Bad — sequential when it could be concurrent
+
+```ts
+const user = await userRepository.find(id);
+const orders = await orderRepository.findByUser(id);
+```
+
+### Good — concurrent
+
+```ts
+const [user, orders] = await Promise.all([
+  userRepository.find(id),
+  orderRepository.findByUser(id),
+]);
+```
+
+- Every `async` function that can reject must have its rejection handled somewhere in the call chain (see "Async Controllers" and "Async Error Handling") — an `async` function is still just a function returning a Promise, and a caller that doesn't `await` or `.catch()` it has created an unhandled rejection.
+
+---
+
 # API Responses / Resources
 
 Always transform entities through a Resource/serializer before returning them. Never return an ORM entity directly.
@@ -954,6 +1069,21 @@ export class UserResource {
 
 Use URL-based versioning (`/api/v1/...`) as the default. Group versioned routers under a `v1`/`v2` namespace so breaking changes to `v2` don't touch `v1` code paths. Internal-only APIs consumed exclusively by a monolith's own first-party frontend do not require versioning.
 
+## Filtering, Sorting & Pagination
+
+Filtering, sorting, and pagination must follow one consistent query-parameter structure across every endpoint — do not invent different parameter names per endpoint (`per_page` on one, `pageSize` on another; `orderBy` on one, `sort` on another).
+
+### Standard shape
+
+```
+GET /users?page=1&limit=20&sort=name&direction=asc
+GET /orders?page=1&limit=20&sort=createdAt&direction=desc&status=paid
+```
+
+- `page` / `limit` (or `cursor` / `limit` for cursor-based pagination — see "API Standards" above for when to prefer cursors) — never a bare unpaginated list of query params that changes shape per resource.
+- `sort` names a single field; `direction` is `asc` or `desc`. Multi-field sort, if needed, uses a comma-separated `sort` value (`sort=lastName,firstName`) rather than repeated differently-named parameters.
+- Filters use the field name directly as the query key (`status=paid`, `role=admin`) and are validated against an allow-list in the endpoint's Zod/Joi schema — never pass an arbitrary filter object straight into a `WHERE` clause.
+
 ## API Error Responses
 
 Use a standardized JSON error structure for every error response, produced by the global error-handling middleware — never let individual routes format their own ad-hoc error shape.
@@ -968,6 +1098,16 @@ Use a standardized JSON error structure for every error response, produced by th
   }
 }
 ```
+
+---
+
+# Date & Time
+
+- **Always store timestamps in UTC.** Never store a naive local timestamp, and never rely on the server's local timezone for anything persisted.
+- Convert to a user's local time only at the presentation boundary (the Resource/serializer, or the client) — business logic and persistence stay in UTC throughout.
+- Always use ISO-8601 strings (`2026-07-18T14:30:00.000Z`) when exchanging dates through the API, both in requests and responses. Never send/accept a Unix timestamp or a locale-formatted string as a public API contract.
+- Avoid raw JavaScript `Date` arithmetic (`date.setDate(date.getDate() + 1)`) for anything beyond trivial comparisons — timezone and DST edge cases make it unreliable. Prefer a dedicated library (`date-fns`, `Luxon`, or `Temporal` once broadly available) for date math, duration calculations, and timezone conversions.
+- A Value Object or DTO representing a date/time should store it as a UTC `Date`/ISO string internally, never as a display-formatted string.
 
 ---
 
@@ -1130,7 +1270,33 @@ Keeping the logic in the Service means it stays reusable and testable outside th
 
 Use events (an in-process `EventEmitter`, or a domain-event dispatcher) when multiple listeners need to react to something that happened. Avoid events as a substitute for a normal function call — if there is exactly one thing that needs to happen next, and it will always need to happen, just call it directly.
 
+Distinguish two kinds of events, since they're handled differently:
+
+- **Domain events** — business facts (see below). Dispatched from Services/Actions, consumed by listeners that trigger further business workflows.
+- **Infrastructure/technical events** — framework- or library-level signals (an HTTP server's `request`/`close` events, a queue library's `completed`/`failed` job events, a DB pool's `connect`/`error` events). These are wired up in `infrastructure/` or the Composition Root, not in domain code, and should not be treated as domain events or emitted from a Service.
+
 ## Domain Events
+
+Domain events represent business facts — something that has already happened and is true, described in the past tense.
+
+### Examples
+- `UserRegistered`
+- `OrderCreated`
+- `InvoicePaid`
+- `TenantProvisioned`
+
+**Domain events should not contain business logic.** They simply describe something that happened — a plain, serializable payload (the entity ID and the facts relevant to that event), nothing more. Listeners react to those events, and it's the listener's job (or the Service the listener calls into) to decide what to do about it.
+
+```ts
+export class OrderCreated {
+  constructor(
+    public readonly orderId: string,
+    public readonly userId: string,
+    public readonly total: number,
+    public readonly occurredAt: Date,
+  ) {}
+}
+```
 
 Prefer domain events over tightly coupling unrelated services to one another.
 
@@ -1150,7 +1316,7 @@ UpdateCrmRecord listener
 NotifySlackChannel listener
 ```
 
-`OrderService` only needs to know that an order was created and emit the event — it should not know or care who reacts to it. This keeps unrelated concerns decoupled and independently testable, and lets new reactions be added without modifying `OrderService`.
+`OrderService` only needs to know that an order was created and emit the event — it should not know or care who reacts to it, or how many listeners exist. This keeps unrelated concerns (email, CRM sync, Slack notifications) decoupled and independently testable, and lets new reactions be added without modifying `OrderService`. This is the same loose coupling the "Domain Boundaries" and "Infrastructure Layer" sections establish elsewhere: a domain announces what happened and stays ignorant of who's listening.
 
 Use a direct call (not an event) when the caller genuinely needs the result synchronously, or when there is exactly one tightly-related consequence that will realistically never need to vary independently.
 
@@ -1216,6 +1382,20 @@ Prefer:
 - **Avoid testing framework internals** (e.g. that Zod rejects a missing required field) — test your own business rules and edge cases.
 
 Every new business feature should include tests where practical.
+
+---
+
+# Dependencies
+
+Prefer the project's existing dependencies over introducing a new library that overlaps with something already in use.
+
+Before adding a new package:
+
+- **Check whether the project already provides equivalent functionality.** Don't add `dayjs` when `date-fns` is already a dependency; don't add `axios` when `node-fetch`/the native `fetch` is already the project's standard.
+- **Avoid duplicate libraries that solve the same problem.** Two validation libraries, two HTTP clients, or two state-management approaches in the same codebase is a maintenance liability, not a matter of taste.
+- **Justify every new dependency** — in the PR description, note what it does that the existing dependency set doesn't, and why it's worth the added attack surface, bundle size, and long-term maintenance burden.
+- **Pin dependency versions deliberately.** Do not introduce a package at an arbitrary or bleeding-edge version "because it's the latest" — match the major version range already used by related packages in the project, and check for known compatibility issues with the project's current Node/TypeScript version before adding it.
+- When an AI assistant is asked to solve a problem, it should default to using what's already imported elsewhere in the codebase before reaching for `npm install`.
 
 ---
 
@@ -1470,6 +1650,19 @@ When generating or modifying Express/TypeScript code:
 32. **Never introduce `any` to make a type error disappear** — fix the underlying type, narrow with a type guard, or as a last resort use `unknown` with explicit validation.
 33. **Never create a circular import between domains** to satisfy a quick fix — route the dependency through `shared/` or a domain event instead.
 
+## AI Refactoring Rules
+
+These apply specifically when an AI assistant (Claude Code, Cursor, Copilot, Codex, etc.) is asked to modify existing code rather than write something new. Following them is what separates a pull request a reviewer can approve quickly from one that needs to be re-done by hand:
+
+- **Read the surrounding files before making changes** — the domain's existing Actions, Services, DTOs, and conventions, not just the one file mentioned in the request.
+- **Reuse existing abstractions before creating new ones** — if a `CreateOrderData` DTO or an `OrderRepository` already exists, use it; don't create a parallel one.
+- **Preserve naming conventions** already established in the file/domain, even where they differ slightly from this document, unless asked to correct them.
+- **Do not move or rename files** unless the task explicitly requires it.
+- **Do not introduce architectural changes unrelated to the requested task** — a request to fix a bug is not an invitation to also introduce a Repository layer or restructure the domain.
+- **Keep diffs minimal** — change what the task requires, and nothing else.
+- **Avoid formatting or restyling unrelated files or lines** — a formatter-driven whitespace diff across an entire file buries the actual change and makes review harder.
+- **Prefer incremental refactoring over large rewrites** — extract one function, fix one violation, move one piece of logic at a time, verifying behavior is preserved at each step, rather than rewriting a file wholesale.
+
 ---
 
 # Pull Request Checklist
@@ -1486,6 +1679,12 @@ Before submitting code, verify:
 - [ ] Uses a Resource/serializer for every API response
 - [ ] No N+1 queries
 - [ ] Transactions used where required, and not opened at more than one layer
+- [ ] No ORM-specific types (Prisma/TypeORM/Mongoose) leaked past the Repository/Model layer into Services, Actions, DTOs, or responses
+- [ ] No new dependency added without checking for an existing equivalent and justifying it in the PR description
+- [ ] Timestamps stored and exchanged in UTC/ISO-8601; no server-local-timezone assumptions
+- [ ] New list endpoints follow the standard `page`/`limit`/`sort`/`direction` query parameter shape
+- [ ] No dependency registration or infrastructure client construction happening outside the Composition Root
+- [ ] Domain events (if used) carry only plain data — no business logic inside the event class itself
 - [ ] Structured logging in place of `console.log`
 - [ ] Tests updated or added where applicable
 - [ ] No unused imports or dead code
