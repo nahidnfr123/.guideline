@@ -153,6 +153,90 @@ Model
 
 ---
 
+# Framework Independence
+
+Business logic must not depend on the HTTP request lifecycle. Any authenticated user, tenant, locale, timezone, or other request-specific context must be passed explicitly into Services and Actions as method arguments or DTOs, rather than retrieved via Laravel helper functions or facades.
+
+This covers not only `auth()`, but also other request concerns such as:
+- Current tenant or company
+- Current locale or timezone
+- Impersonation context
+- Authenticated user
+- Request IP or user agent
+
+## Prohibited in Services, Actions, Repositories, Models, Domains, and Value Objects:
+- `auth()` and `Auth` facade
+- `request()` and `Request` facade
+- `session()`
+- `cookie()`
+- `redirect()`
+- `response()`
+- `abort()`
+- `view()`
+- `back()`
+- `old()`
+- `url()`
+
+These are HTTP/UI concerns.
+
+## Allowed Context Retrieval Exceptions:
+You may retrieve HTTP/UI/session context only within specific Laravel infrastructure classes:
+- Middleware
+- Controllers
+- Form Requests
+- Policies
+- Gates
+- Blade Components
+- Notifications (sometimes, when building context-dependent messages)
+- Listeners (sometimes, when acting as UI/HTTP boundaries)
+
+## Context Ingestion Principle:
+Controllers (and other entry-points like console commands or jobs) are responsible for extracting framework-specific data. Services and Actions should receive everything they need through:
+- Method parameters
+- DTOs
+- Constructor injection
+
+They should never retrieve runtime context themselves.
+
+### Bad
+
+```php
+class CreateOrderAction
+{
+    public function handle(array $data)
+    {
+        $user = auth()->user(); // Bad: Hidden HTTP dependency
+        // ...
+    }
+}
+```
+
+### Good
+
+```php
+class CreateOrderAction
+{
+    public function handle(User $user, array $data)
+    {
+        // ...
+    }
+}
+```
+
+In the Controller:
+
+```php
+public function store(StoreOrderRequest $request)
+{
+    $this->createOrderAction->handle(
+        $request->user(),
+        $request->validated()
+    );
+}
+```
+
+---
+
 # Actions vs Services
 
 ## Actions
