@@ -38,6 +38,8 @@ Business rules belong in:
 - Value Objects
 - Policies
 
+Choose the most appropriate abstraction based on the nature of the rule.
+
 Business rules must never live inside:
 
 - Controllers
@@ -160,7 +162,7 @@ Controller (HTTP/CLI Request Boundary)
 Application Layer (Service, Action, or Service delegating to Action)
     │
     ▼
-Persistence Layer (Repository if one exists, otherwise Model directly)
+Data Access Layer (Repository if one exists, otherwise Model directly)
 ```
 
 The Application Layer is not required to be both a Service *and* an Action. Depending on the project and the specific operation, it may be:
@@ -460,6 +462,8 @@ Avoid:
 - API calls
 - Complex calculations
 
+Avoid putting query-building methods unrelated to the Model's own concerns into the Model itself. Complex reporting queries — multi-table joins, aggregations spanning several entities, dashboard-style queries — belong in dedicated query objects or Repositories, not as ad-hoc scopes bolted onto the Model.
+
 ## Mass Assignment
 
 Always define `$fillable` explicitly on every Model. Do not use `$guarded = []`.
@@ -543,6 +547,20 @@ User::with('posts')->get();
 Always prevent N+1 queries.
 
 Always eager load relationships.
+
+Prefer `exists()` over `count() > 0` when checking existence — it stops at the first match instead of counting every row.
+
+### Bad
+
+```php
+User::query()->count() > 0;
+```
+
+### Good
+
+```php
+User::query()->exists();
+```
 
 ---
 
@@ -679,6 +697,23 @@ In larger projects, avoid a flat list of classes in `app/Http/Requests`. Organiz
   - `app/Http/Requests/User/UpdateUserRequest.php`
 - **In Domain-Driven Layouts:** Place requests directly inside their corresponding Domain folder, e.g.:
   - `app/Domains/User/Requests/StoreUserRequest.php`
+
+Do not inject Request into Services or Actions.
+
+### Bad
+
+```php
+public function handle(Request $request)
+```
+
+### Good
+
+```php
+public function handle(
+    User $user,
+    CreateOrderData $data
+)
+```
 
 ---
 
@@ -963,11 +998,16 @@ catch (\Exception $e) {
 
 ```php
 catch (\Throwable $e) {
-    Log::error($e);
+    Log::error('Failed to create invoice', [
+        'exception' => $e,
+        'invoice_id' => $invoice->id,
+    ]);
 
     throw $e;
 }
 ```
+
+Context is everything — a bare `Log::error($e)` gives you a stack trace with no idea which invoice, user, or request triggered it. Always log the exception alongside the identifiers needed to reproduce or locate the affected record.
 
 Use custom exceptions where appropriate.
 
@@ -1023,6 +1063,8 @@ DB::transaction(function () {
 });
 ```
 
+Avoid performing external API calls (Stripe, HubSpot, third-party sync, etc.) inside a database transaction whenever possible. Commit the transaction first, then dispatch jobs or events that trigger external calls. Holding a database lock while waiting on a third-party network response is a common source of contention and can hold up unrelated queries for the duration of the external call.
+
 ---
 
 # Queues
@@ -1044,6 +1086,8 @@ Do not queue trivial in-memory operations or single fast (< ~100ms) DB writes �
 Use events when multiple listeners need to react.
 
 Avoid events for simple sequential code.
+
+Events represent something that happened. They should not be used as a substitute for a normal method call — if there is exactly one thing that needs to happen next and it will always need to happen, just call it directly.
 
 ## Domain Events
 
@@ -1216,17 +1260,7 @@ Never trust original filenames.
 
 ## Query Performance Standards
 
-Prefer:
-
-```php
-User::query()->exists();
-```
-
-instead of:
-
-```php
-User::query()->count() > 0;
-```
+See "Database Queries" for the `exists()` vs `count() > 0` rule.
 
 Avoid:
 
@@ -1356,6 +1390,7 @@ When generating or modifying Laravel code:
 28. **Define `$fillable` explicitly on every Model** — never use `$guarded = []`.
 29. **Do not introduce an Actions layer, Repository, or other abstraction merely because this document mentions it** — introduce it when the stated justification (reuse, multiple data sources, complex queries, caching, etc.) actually applies. Unjustified abstraction is itself a violation of these standards.
 30. **Never generate code that violates this document merely because it is shorter or faster to produce.** Architecture and correctness are preferred over brevity — do not skip Form Requests, Resources, Policies, or DTOs to save a few lines.
+31. **When modifying existing code, preserve the existing public behavior unless the requested change explicitly requires altering it.** Refactoring must not introduce behavioral changes — moving code between layers, extracting methods, or renaming internals should produce identical outputs for identical inputs.
 
 ---
 
@@ -1383,3 +1418,4 @@ Before submitting code, verify:
 - [ ] New configuration documented
 - [ ] Model `$fillable` reviewed for new/changed columns
 - [ ] Migration `down()` method verified
+- [ ] No breaking database changes without a migration strategy (e.g. backfilling, dual-write period, or a documented rollout plan for column drops/renames)
