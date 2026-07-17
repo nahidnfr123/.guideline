@@ -1,6 +1,6 @@
 # Laravel Coding Standards
 
-This document defines the coding standards for all Laravel projects. Every developer and AI coding assistant (Claude Code, ChatGPT, Copilot, Cursor, etc.) must follow these standards consistently.
+This document defines the coding standards for all Laravel projects. Every developer and AI coding assistant (Opencode, Claude Code, Antigravity, ChatGPT, Copilot, Cursor, etc.) must follow these standards consistently.
 
 ---
 
@@ -169,6 +169,20 @@ class UserOnboardingService
     }
 }
 ```
+
+## Choosing Between an Action and a Service
+
+Use an Action when:
+
+- The operation performs one business task.
+- The operation can be reused independently.
+- The class naturally exposes a single `handle()` method.
+
+Use a Service when:
+
+- Multiple Actions must be coordinated.
+- The workflow spans several business operations.
+- The process includes transactions, events, notifications, or external integrations.
 
 ### Rule:
 - Business logic belongs in **Actions**.
