@@ -154,11 +154,13 @@ To maintain a clean codebase, adhere strictly to the following directional flow 
 ## Allowed:
 
 ```
-Controller
-    ↓
-Application Layer  (Service, or Action, or Service → Action)
-    ↓
-Persistence  (Repository, if one exists — otherwise the Model directly)
+Controller (HTTP/CLI Request Boundary)
+    │
+    ▼ [Rule: Controllers must NEVER bypass the Application Layer to touch Persistence directly]
+Application Layer (Service, Action, or Service delegating to Action)
+    │
+    ▼
+Persistence Layer (Repository if one exists, otherwise Model directly)
 ```
 
 The Application Layer is not required to be both a Service *and* an Action. Depending on the project and the specific operation, it may be:
