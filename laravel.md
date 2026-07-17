@@ -7,7 +7,7 @@ This document defines the coding standards for all Laravel projects. Every devel
 # Core Principles
 
 - Follow SOLID principles.
-- Follow PSR-12 coding standards.
+- Follow PSR-12/PER coding standards.
 - Prefer readability over clever code.
 - Keep methods small and focused.
 - Avoid duplicated logic (DRY).
@@ -17,21 +17,25 @@ This document defines the coding standards for all Laravel projects. Every devel
 
 ---
 
-# Project Structure
+# Architecture Evolution
 
-Business logic must never live inside controllers.
+Choose the simplest architecture that satisfies current requirements. Do not introduce complex structures prematurely.
+
+## Small Projects
+
+Use the standard flat Laravel directory structure.
 
 ```
-Controller
-    ↓
-Service
-    ↓
-Repository (if needed)
-    ↓
-Model
+app/
+    Http/
+    Models/
+    Services/
+    ...
 ```
 
-Use the following structure:
+## Medium Projects
+
+Introduce Actions, DTOs, and Enums to keep business logic organized.
 
 ```
 app/
@@ -57,6 +61,119 @@ app/
     ValueObjects/
 ```
 
+## Large Projects
+
+Consider domain-based organization to prevent coupling and manage scale.
+
+```
+app/
+    Domains/
+        User/
+        Billing/
+        Inventory/
+        Reporting/
+```
+
+Each domain folder owns its own domain-specific layers:
+- Actions
+- DTOs
+- Events
+- Jobs
+- Models
+- Policies
+- Services
+
+---
+
+# Dependency Rules
+
+To maintain a clean codebase, adhere strictly to the following directional flow of dependencies.
+
+## Allowed:
+
+```
+Controller
+    ↓
+Service
+    ↓
+Action
+    ↓
+Repository
+    ↓
+Model
+```
+
+## Disallowed:
+
+- Controllers calling repositories directly
+- Models calling services
+- Models dispatching business workflows
+- Services depending on controllers
+- Circular dependencies between classes
+
+---
+
+# Actions vs Services
+
+## Actions
+
+Actions represent a single business operation or use case.
+
+### Characteristics:
+- One responsibility
+- One public `handle()` method
+- Easily testable
+- Reusable
+
+### Examples:
+- `CreateUserAction`
+- `ApproveOrderAction`
+- `AssignRoleAction`
+- `UploadDocumentAction`
+
+### Example:
+
+```php
+class CreateUserAction
+{
+    public function handle(CreateUserData $data): User
+    {
+        return User::create([...]);
+    }
+}
+```
+
+## Services
+
+Services coordinate multiple actions and orchestrate business workflows.
+
+### Characteristics:
+- Multiple methods allowed
+- Orchestrates business processes
+- Coordinates actions, repositories, jobs, and events
+
+### Example:
+
+```php
+class UserOnboardingService
+{
+    public function onboard(CreateUserData $data): User
+    {
+        $user = $this->createUserAction->handle($data);
+
+        $this->assignDefaultRoleAction->handle($user);
+
+        $this->sendWelcomeEmailAction->handle($user);
+
+        return $user;
+    }
+}
+```
+
+### Rule:
+- Business logic belongs in **Actions**.
+- Workflow orchestration belongs in **Services**.
+
 ---
 
 # Controllers
@@ -64,7 +181,7 @@ app/
 Controllers should only:
 
 - Validate request
-- Call service
+- Call service/action
 - Return response
 
 Bad
@@ -103,7 +220,7 @@ Controllers should not:
 
 # Services
 
-Services contain business logic.
+Services contain business logic and orchestration workflows.
 
 Each service should have a single responsibility.
 
@@ -364,6 +481,18 @@ $invoiceItem
 $totalRevenue
 ```
 
+## Class Naming Conventions
+
+Always align class names with their roles:
+
+- **Actions:** `CreateUserAction`, `UpdateOrderAction`
+- **Services:** `UserService`, `PaymentService`
+- **Requests:** `StoreUserRequest`, `UpdateUserRequest`
+- **Resources:** `UserResource`, `OrderResource`
+- **Policies:** `UserPolicy`, `OrderPolicy`
+- **DTOs:** `CreateUserData`, `UpdateOrderData`
+- **Enums:** `UserStatus`, `OrderStatus`
+
 ---
 
 # Method Size
@@ -411,8 +540,17 @@ Never use
 
 ```php
 dd()
+```
+
+```php
 dump()
+```
+
+```php
 var_dump()
+```
+
+```php
 print_r()
 ```
 
@@ -422,7 +560,13 @@ Use
 
 ```php
 Log::info();
+```
+
+```php
 Log::warning();
+```
+
+```php
 Log::error();
 ```
 
@@ -533,6 +677,48 @@ Every new business feature should include tests where practical.
 
 ---
 
+# Code Quality Tooling
+
+Every project should include automated code quality tools.
+
+## Required
+
+- **Laravel Pint** (Code formatting)
+- **Larastan (PHPStan)** (Static analysis)
+- **PHPUnit or Pest** (Testing frameworks)
+
+## Optional
+
+- Rector
+- Laravel IDE Helper
+- Infection PHP
+
+## Commands
+
+Format code:
+```bash
+./vendor/bin/pint
+```
+
+Static analysis:
+```bash
+./vendor/bin/phpstan analyse
+```
+
+Run tests:
+```bash
+php artisan test
+```
+
+## CI Requirements
+
+Pull requests should fail when:
+- Pint fails to format code
+- PHPStan reports compilation or type errors
+- Tests fail
+
+---
+
 # Security
 
 Always:
@@ -560,7 +746,43 @@ Never trust original filenames.
 
 ---
 
-# Performance
+# Performance & Query Standards
+
+## Query Performance Standards
+
+Prefer:
+
+```php
+User::query()->exists();
+```
+
+instead of:
+
+```php
+User::query()->count() > 0;
+```
+
+Avoid:
+
+```php
+Model::all();
+```
+
+for large datasets.
+
+Use:
+
+- `paginate()`
+- `chunk()`
+- `chunkById()`
+- `cursor()`
+- `lazy()`
+
+when processing large amounts of data.
+
+Always review queries for N+1 issues.
+
+## General Performance Rules
 
 Always:
 
@@ -633,13 +855,13 @@ public function calculate(User $user): Invoice
 
 ---
 
-# AI Assistant Rules
+# AI Assistant Rules & Guidelines
 
 When generating or modifying Laravel code:
 
 1. Follow SOLID principles.
 2. Never place business logic in controllers.
-3. Prefer Services over fat Models.
+3. Prefer Services/Actions over fat Models.
 4. Use Form Requests for validation.
 5. Use Resources for API responses.
 6. Prevent N+1 queries.
@@ -650,8 +872,14 @@ When generating or modifying Laravel code:
 11. Never leave debug statements (`dd`, `dump`, etc.).
 12. Write clean, readable, production-quality code.
 13. Refactor duplicated logic instead of copying code.
-14. Preserve existing architecture unless an improvement is justified.
-15. Consider performance, scalability, and maintainability before introducing new code.
+14. Follow the existing architecture and conventions.
+15. Reuse existing classes before creating new ones.
+16. Do not introduce new patterns unless justified.
+17. Prefer consistency over personal preference.
+18. Keep changes minimal and focused.
+19. Preserve backward compatibility unless instructed otherwise.
+20. Refactor when complexity becomes excessive.
+21. Consider performance, scalability, and maintainability before introducing new code.
 
 ---
 
@@ -659,7 +887,7 @@ When generating or modifying Laravel code:
 
 Before submitting code, verify:
 
-- [ ] PSR-12 compliant
+- [ ] PSR-12/PER compliant
 - [ ] No duplicated code
 - [ ] No business logic in controllers
 - [ ] Validation via Form Requests
