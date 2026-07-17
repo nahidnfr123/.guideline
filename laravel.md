@@ -4,6 +4,19 @@ This document defines the coding standards for all Laravel projects. Every devel
 
 ---
 
+# Architecture Principles
+
+To build scalable, robust, and clean applications, adhere to these fundamental principles:
+
+- **High cohesion:** Group related logic together.
+- **Low coupling:** Keep subsystems independent to minimize side-effects.
+- **Dependency inversion:** Depend on abstractions, not on concrete implementations.
+- **Single responsibility:** A class or method should have one, and only one, reason to change.
+- **Explicit dependencies:** Inject dependencies clearly rather than resolving them implicitly.
+- **Favor composition over inheritance:** Combine smaller components rather than building deep class hierarchies.
+
+---
+
 # Core Principles
 
 - Follow SOLID principles.
@@ -11,9 +24,36 @@ This document defines the coding standards for all Laravel projects. Every devel
 - Prefer readability over clever code.
 - Keep methods small and focused.
 - Avoid duplicated logic (DRY).
-- Prefer composition over inheritance.
 - Never write code that "just works"; write code that is maintainable.
 - Every piece of business logic should have a single responsible location.
+
+---
+
+# Control Flow
+
+Prefer early returns over deeply nested conditionals. Keep nesting levels as shallow as possible, aiming to avoid more than 2-3 levels of nesting.
+
+### Bad
+
+```php
+if ($user) {
+    if ($user->active) {
+        // ...
+    }
+}
+```
+
+### Good
+
+```php
+if (! $user) {
+    return;
+}
+
+if (! $user->active) {
+    return;
+}
+```
 
 ---
 
@@ -172,14 +212,12 @@ class UserOnboardingService
 
 ## Choosing Between an Action and a Service
 
-Use an Action when:
-
+Use an **Action** when:
 - The operation performs one business task.
 - The operation can be reused independently.
 - The class naturally exposes a single `handle()` method.
 
-Use a Service when:
-
+Use a **Service** when:
 - Multiple Actions must be coordinated.
 - The workflow spans several business operations.
 - The process includes transactions, events, notifications, or external integrations.
@@ -198,7 +236,7 @@ Controllers should only:
 - Call service/action
 - Return response
 
-Bad
+### Bad
 
 ```php
 public function store(Request $request)
@@ -211,7 +249,7 @@ public function store(Request $request)
 }
 ```
 
-Good
+### Good
 
 ```php
 public function store(StoreUserRequest $request)
@@ -238,7 +276,7 @@ Services contain business logic and orchestration workflows.
 
 Each service should have a single responsibility.
 
-Good
+### Good
 
 ```
 UserService
@@ -247,9 +285,7 @@ PaymentService
 ForecastCalculationService
 ```
 
-Avoid massive services.
-
-If a service exceeds roughly 400–500 lines, consider splitting it.
+Large services often indicate multiple responsibilities. Review any service exceeding ~300 lines. Refactor before it becomes difficult to understand.
 
 ---
 
@@ -279,7 +315,7 @@ Always use Form Requests.
 
 Never validate directly inside controllers.
 
-Good
+### Good
 
 ```
 StoreInvoiceRequest
@@ -292,7 +328,7 @@ UpdateCustomerRequest
 
 Never execute queries inside loops.
 
-Bad
+### Bad
 
 ```php
 foreach ($users as $user) {
@@ -300,7 +336,7 @@ foreach ($users as $user) {
 }
 ```
 
-Good
+### Good
 
 ```php
 User::with('posts')->get();
@@ -309,6 +345,23 @@ User::with('posts')->get();
 Always prevent N+1 queries.
 
 Always eager load relationships.
+
+---
+
+# Collection Standards
+
+Prefer Collection methods where readability improves.
+
+### Good
+
+```php
+collect($users)
+    ->filter(...)
+    ->map(...)
+    ->groupBy(...);
+```
+
+Do not chain collections excessively. If the chain becomes difficult to read, refactor into variables or dedicated methods.
 
 ---
 
@@ -334,17 +387,31 @@ unless necessary.
 
 ---
 
+# Constructors
+
+Constructors should only assign dependencies.
+
+Avoid:
+- Business logic
+- Database queries
+- API calls
+- File operations
+
+Constructors must be lightweight and completely side-effect free.
+
+---
+
 # Dependency Injection
 
 Always use constructor injection.
 
-Bad
+### Bad
 
 ```php
 new UserService();
 ```
 
-Good
+### Good
 
 ```php
 public function __construct(
@@ -366,7 +433,7 @@ app(UserService::class)
 
 Bind interfaces to implementations.
 
-Good
+### Good
 
 ```
 UserRepositoryInterface
@@ -379,16 +446,14 @@ Register bindings in Service Providers.
 
 # Repositories
 
-Use repositories only when they provide value.
+Do not introduce repositories by default. Repositories are justified only when they provide meaningful abstraction, such as:
 
-Do NOT create repositories for simple CRUD.
+- Multiple persistence implementations
+- External data sources
+- Reusable complex queries
+- Caching layers
 
-Use repositories when:
-
-- multiple data sources
-- reusable complex queries
-- caching
-- external APIs
+Simple CRUD applications generally do not benefit from repositories.
 
 ---
 
@@ -412,7 +477,7 @@ Always use API Resources.
 
 Never return Eloquent models directly.
 
-Good
+### Good
 
 ```
 UserResource
@@ -421,11 +486,22 @@ InvoiceResource
 
 ---
 
+# API Standards
+
+- Use API Resources.
+- Return consistent response structures.
+- Use proper HTTP status codes.
+- Paginate collections.
+- Avoid exposing internal attributes.
+- Version public APIs when necessary.
+
+---
+
 # DTOs
 
 Use DTOs for large service inputs.
 
-Example
+### Example
 
 ```
 CreateInvoiceData
@@ -441,13 +517,13 @@ Avoid passing huge arrays.
 
 Use PHP Enums instead of magic strings.
 
-Bad
+### Bad
 
 ```php
 $status = "pending";
 ```
 
-Good
+### Good
 
 ```php
 Status::Pending
@@ -459,13 +535,13 @@ Status::Pending
 
 Never hardcode values.
 
-Bad
+### Bad
 
 ```php
 if ($role == "admin")
 ```
 
-Good
+### Good
 
 ```php
 Role::ADMIN
@@ -477,7 +553,7 @@ Role::ADMIN
 
 Use descriptive names.
 
-Bad
+### Bad
 
 ```
 $data
@@ -486,7 +562,7 @@ $item
 $x
 ```
 
-Good
+### Good
 
 ```
 $customer
@@ -506,6 +582,21 @@ Always align class names with their roles:
 - **Policies:** `UserPolicy`, `OrderPolicy`
 - **DTOs:** `CreateUserData`, `UpdateOrderData`
 - **Enums:** `UserStatus`, `OrderStatus`
+
+## Boolean Methods
+
+Use descriptive prefixes for boolean methods to return clearly identifiable true/false states.
+
+### Prefer:
+- `isActive()`
+- `hasPermission()`
+- `canEdit()`
+- `shouldSync()`
+
+### Avoid:
+- `check()`
+- `verify()`
+- `flag()`
 
 ---
 
@@ -529,11 +620,23 @@ Review classes larger than 500 lines.
 
 ---
 
+# PHP Standards
+
+Always:
+- declare strict types
+- use final classes when extension is unnecessary
+- use readonly where applicable
+- prefer enums over constants
+- use typed properties
+- declare return types
+
+---
+
 # Comments
 
-Code should be self-explanatory.
+Code should be self-explanatory. Avoid obvious code documentation.
 
-Avoid:
+### Bad:
 
 ```php
 // increment counter
@@ -548,39 +651,41 @@ Comment only when explaining:
 
 ---
 
+# Documentation
+
+Document:
+- Complex algorithms
+- Public APIs
+- Reusable services
+
+Do not document obvious code.
+
+---
+
 # Logging
 
-Never use
+Never use `dd()`, `dump()`, `var_dump()`, or `print_r()` in committed code.
+
+Use structured logging:
 
 ```php
-dd()
+Log::info('User created', [
+    'user_id' => $user->id,
+    'email' => $user->email,
+]);
 ```
+
+Avoid unstructured logs like:
 
 ```php
-dump()
+Log::info($user);
 ```
 
-```php
-var_dump()
-```
-
-```php
-print_r()
-```
-
-in committed code.
-
-Use
+Supported levels:
 
 ```php
 Log::info();
-```
-
-```php
 Log::warning();
-```
-
-```php
 Log::error();
 ```
 
@@ -590,7 +695,7 @@ Log::error();
 
 Never swallow exceptions.
 
-Bad
+### Bad
 
 ```php
 catch (\Exception $e) {
@@ -598,7 +703,7 @@ catch (\Exception $e) {
 }
 ```
 
-Good
+### Good
 
 ```php
 catch (\Throwable $e) {
@@ -651,19 +756,29 @@ Avoid events for simple sequential code.
 
 Never hardcode configuration.
 
-Use
+Use:
 
 ```php
 config(...)
 ```
 
-Never
+Never:
 
 ```php
 env(...)
 ```
 
 outside configuration files.
+
+Never hardcode:
+- URLs
+- API endpoints
+- Feature flags
+- Timeouts
+- Retry counts
+- Cache durations
+
+Place them in configuration files.
 
 ---
 
@@ -830,7 +945,7 @@ Create new migrations instead.
 
 Keep routes clean.
 
-Good
+### Good
 
 ```php
 Route::apiResource('users', UserController::class);
@@ -861,7 +976,7 @@ Always:
 - use readonly properties when appropriate
 - use nullable types explicitly
 
-Example
+### Example
 
 ```php
 public function calculate(User $user): Invoice
@@ -894,6 +1009,11 @@ When generating or modifying Laravel code:
 19. Preserve backward compatibility unless instructed otherwise.
 20. Refactor when complexity becomes excessive.
 21. Consider performance, scalability, and maintainability before introducing new code.
+22. **Prefer refactoring over rewriting** when modifying existing code.
+23. **Preserve existing public APIs** unless instructed otherwise.
+24. **Do not rename files or classes** unnecessarily.
+25. **Match the existing project's coding style**.
+26. **Avoid introducing additional dependencies** without justification.
 
 ---
 
@@ -913,4 +1033,8 @@ Before submitting code, verify:
 - [ ] Tests updated or added where applicable
 - [ ] No unused imports or dead code
 - [ ] Clear variable and method names
-- [ ] Documentation updated if behavior changed
+- [ ] Documentation updated if behavior/architecture changed
+- [ ] No commented-out code
+- [ ] No TODO left behind
+- [ ] No debug logging
+- [ ] New configuration documented
